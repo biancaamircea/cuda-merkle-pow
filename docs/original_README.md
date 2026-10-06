@@ -1,31 +1,27 @@
-# Tema 2 ASC - CUDA Merkle Root si Proof of Work
+# Computer Systems Architecture Assignment 2 -- CUDA Merkle Root and Proof of Work
 
 **Student:** Mircea Bianca-Anastasia  
-**Grupa:** 333CC  
-**Fisiere incluse in arhiva:** `utils.cu`, `README.md`
+**Group:** 333CC  
+**Files included in the original submission archive:** `utils.cu`, `README.md`
 
----
+## 1. Overview
 
-## 1. Prezentare
+This assignment implements two expensive stages of a simplified block-mining process on the GPU:
 
-Aceasta tema implementeaza pe GPU doua etape costisitoare din procesul simplificat de minare al unui bloc:
+- computing the Merkle root of the block's transactions;
+- finding a valid Proof-of-Work nonce.
 
-- obtinerea Merkle root-ului pentru tranzactiile din bloc;
-- determinarea unui nonce valid pentru Proof of Work.
+The implementation in `utils.cu` uses CUDA to distribute work across threads. The CPU coordinates calls, transfers data and writes the final result. The GPU performs repetitive hashing.
 
-Implementarea este realizata in `utils.cu` si foloseste CUDA pentru a distribui munca pe mai multe thread-uri. Partea de CPU ramane responsabila pentru coordonarea apelurilor, copierea datelor si scrierea rezultatului final, iar GPU-ul executa operatiile repetitive de hash-uire.
+The solution uses three main ideas:
 
-Solutia foloseste trei idei principale:
+1. Transactions are hashed in parallel.
+2. The Merkle tree is built level by level using two alternating buffers.
+3. Nonces are tested in batches, and a valid result is selected using atomic operations.
 
-1. tranzactiile sunt hash-uite in paralel;
-2. arborele Merkle este construit pe niveluri, folosind doua buffere alternate;
-3. nonce-urile sunt testate in batch-uri, iar rezultatul valid este selectat folosind operatii atomice.
+## 2. Key code elements
 
----
-
-## 2. Elemente importante din cod
-
-In implementare apar urmatoarele constante si structuri globale:
+The implementation uses these constants:
 
 ```c
 #define MERKLE_THREADS 256
@@ -33,9 +29,9 @@ In implementare apar urmatoarele constante si structuri globale:
 #define NONCE_BATCH_SIZE (1ULL << 16)
 ```
 
-Pentru Merkle root se folosesc 256 de thread-uri per block. Aceeasi dimensiune este folosita si pentru kernelul de nonce. Spatiul de cautare pentru nonce este impartit in batch-uri de `2^16` valori, pentru a limita dimensiunea fiecarei lansari de kernel si pentru a permite verificarea periodica pe host.
+Both the Merkle and nonce kernels use 256 threads per block. The nonce search is split into batches of 2^16 values to limit each kernel launch and allow periodic host-side checks.
 
-Memoria de pe GPU este pastrata in buffere globale:
+GPU memory is stored in global buffers:
 
 ```c
 static BYTE *g_d_transactions = NULL;
@@ -46,77 +42,73 @@ static uint32_t *g_d_best_nonce = NULL;
 static int *g_d_found = NULL;
 ```
 
-Aceste buffere sunt reutilizate intre apeluri, pentru a evita costul unor alocari repetate.
+These buffers are reused across calls to avoid repeated allocations.
 
----
+## 3. Memory management
 
-## 3. Gestionarea memoriei
-
-Pentru alocarea bufferelor folosesc functia auxiliara:
+The allocation helper is:
 
 ```c
 static void ensure_byte_buffer(BYTE **ptr, size_t *capacity, size_t needed)
 ```
 
-Aceasta verifica daca bufferul existent are deja suficienta capacitate. Daca da, bufferul este reutilizat. Daca nu, vechiul buffer este eliberat si se face o noua alocare cu `cudaMalloc`.
+It checks whether the existing buffer has enough capacity. If so, it reuses it. Otherwise, it frees the old buffer and allocates a replacement with `cudaMalloc`.
 
-Aceasta abordare este utila deoarece functiile `construct_merkle_root` si `find_nonce` pot fi apelate pentru mai multe blocuri. Fara reutilizarea memoriei, timpul ar fi afectat de apeluri frecvente la `cudaMalloc` si `cudaFree`.
+Both `construct_merkle_root` and `find_nonce` may be called for multiple blocks. Reusing memory avoids frequent `cudaMalloc` and `cudaFree` calls.
 
-Toate apelurile CUDA sunt verificate cu macro-ul `CUDA_CHECK`, astfel incat eventualele erori sa fie detectate imediat.
+All CUDA calls are checked using `CUDA_CHECK` so errors can be detected immediately.
 
----
+## 4. Computing the Merkle root
 
-## 4. Calculul Merkle root-ului
+### 4.1. Initial transaction hashes
 
-### 4.1. Hash-ul initial al tranzactiilor
-
-Functia `construct_merkle_root` incepe prin copierea tranzactiilor pe GPU:
+`construct_merkle_root` first copies transactions to the GPU:
 
 ```c
 cudaMemcpy(g_d_transactions, transactions, transactions_bytes, cudaMemcpyHostToDevice)
 ```
 
-Apoi se lanseaza kernelul:
+It then launches:
 
 ```c
 hash_transactions_kernel<<<blocks, threads>>>(...)
 ```
 
-Fiecare thread calculeaza hash-ul unei tranzactii. Indexul tranzactiei este obtinut din `blockIdx`, `blockDim` si `threadIdx`.
+Each thread hashes one transaction. Its index is derived from `blockIdx`, `blockDim` and `threadIdx`.
 
-Se foloseste lungimea `transaction_size - 1`, deoarece dimensiunea tranzactiei include si caracterul nul de final, iar acesta nu trebuie inclus in hash-ul efectiv al tranzactiei.
+The hash uses `transaction_size - 1` bytes because the transaction size includes the terminating null character, which must not be hashed.
 
-### 4.2. Reducerea nivelurilor
+### 4.2. Level reduction
 
-Dupa hash-uirea tranzactiilor, vectorul de hash-uri este redus pana cand ramane un singur element. Aceasta reducere este facuta cu kernelul:
+After hashing the transactions, the array is reduced until one hash remains:
 
 ```c
 merkle_level_kernel<<<level_blocks, threads>>>(...)
 ```
 
-Pentru fiecare pozitie din nivelul urmator, un thread ia doua hash-uri din nivelul curent:
+Each thread produces one entry in the next level by processing two hashes:
 
 ```c
 left  = in_hashes + (2 * idx) * SHA256_HASH_SIZE;
 right = in_hashes + (2 * idx + 1) * SHA256_HASH_SIZE;
 ```
 
-Daca nu exista al doilea hash, atunci `right` devine egal cu `left`. In acest mod se respecta regula Merkle conform careia ultimul hash se dubleaza atunci cand numarul de noduri de pe un nivel este impar.
+If the second hash does not exist, `right` is set to `left`. This implements the Merkle rule of duplicating the last hash when a level has an odd number of nodes.
 
-### 4.3. Concatenarea logica a hash-urilor
+### 4.3. Logical concatenation
 
-Pentru a calcula hash-ul unei perechi, nu construiesc un buffer separat cu cele doua hash-uri concatenate. In schimb, folosesc functia `apply_sha256_two_parts`, care actualizeaza acelasi context SHA-256 cu prima parte si apoi cu a doua parte:
+Rather than copying both hashes into a separate concatenation buffer, `apply_sha256_two_parts` updates the same SHA-256 context with each part:
 
 ```c
 sha256_update(&ctx, a, len_a);
 sha256_update(&ctx, b, len_b);
 ```
 
-Rezultatul este acelasi ca pentru concatenarea efectiva, dar se evita o copiere intermediara.
+This produces the same result as hashing the concatenated input while avoiding an intermediate copy.
 
-### 4.4. Alternarea bufferelor
+### 4.4. Alternating buffers
 
-Pentru reducerea arborelui folosesc doua buffere, `g_d_hashes_a` si `g_d_hashes_b`. Un nivel citeste dintr-un buffer si scrie in celalalt. Dupa fiecare nivel, pointerii sunt schimbati:
+The tree reduction uses `g_d_hashes_a` and `g_d_hashes_b`. Each level reads from one buffer and writes to the other. Their pointers are swapped after each level:
 
 ```c
 BYTE *tmp = in_hashes;
@@ -124,27 +116,25 @@ in_hashes = out_hashes;
 out_hashes = tmp;
 ```
 
-Aceasta tehnica simplifica implementarea si evita mutarea nivelurilor intermediare pe CPU.
+This avoids copying intermediate levels to the CPU.
 
-La final, cand `current_n` devine 1, singurul hash ramas este copiat pe host in `merkle_root`.
+When `current_n` reaches 1, the remaining hash is copied to the host's `merkle_root`.
 
----
+## 5. Nonce search
 
-## 5. Cautarea nonce-ului
+### 5.1. Batched search
 
-### 5.1. Impartirea cautarii in batch-uri
-
-Functia `find_nonce` cauta un nonce intre `0` si `max_nonce`. Pentru a nu lansa un kernel urias, cautarea este impartita in batch-uri:
+`find_nonce` searches from 0 to `max_nonce` in batches:
 
 ```c
 const uint64_t BATCH_SIZE = NONCE_BATCH_SIZE;
 ```
 
-Pentru fiecare batch, se calculeaza numarul de blocuri CUDA necesare si se lanseaza `find_nonce_kernel`.
+For each batch, the required CUDA block count is calculated and `find_nonce_kernel` is launched.
 
-### 5.2. Contextul SHA-256 pentru prefix
+### 5.2. SHA-256 prefix context
 
-Inainte de lansarea kernelului, partea fixa a blocului este introdusa intr-un context SHA-256:
+Before launching the kernel, the fixed portion of the block is processed:
 
 ```c
 SHA256_CTX prefix_ctx;
@@ -152,113 +142,103 @@ sha256_init(&prefix_ctx);
 sha256_update(&prefix_ctx, block_content, current_length);
 ```
 
-Acest context este transmis kernelului. Fiecare thread primeste o copie a lui si adauga doar nonce-ul. Astfel, partea constanta a blocului nu este procesata de la zero pentru fiecare incercare.
+The context is passed to the kernel. Each thread copies it and appends only its nonce, avoiding repeated processing of the fixed prefix.
 
-### 5.3. Conversia nonce-ului
+### 5.3. Nonce conversion
 
-Nonce-ul trebuie concatenat la block content ca sir de caractere. Pe GPU folosesc functia:
+The nonce must be appended to the block content as a string. The GPU uses:
 
 ```c
 __device__ __forceinline__ int intToString(uint64_t num, char* out)
 ```
 
-Aceasta converteste numarul in reprezentare zecimala. Am folosit aceasta functie in loc de `sprintf`, deoarece `sprintf` este prea costisitor pentru a fi apelat de foarte multe thread-uri CUDA.
+This converts the number to decimal text. A custom function is used instead of `sprintf` to avoid its cost across many CUDA threads.
 
-### 5.4. Verificarea dificultatii
+### 5.4. Difficulty check
 
-Kernelul nu compara direct stringuri hex complete pentru fiecare nonce. In schimb, functia:
+The kernel does not generate and compare full hexadecimal strings for every candidate. Instead:
 
 ```c
 sha256_ctx_suffix_has_zero_prefix(...)
 ```
 
-calculeaza digest-ul binar si verifica daca inceputul acestuia are numarul necesar de zerouri hex.
+computes the binary digest and checks the required number of leading hexadecimal zeros.
 
-Pentru un numar par de zerouri, se verifica octeti intregi egali cu 0. Pentru un numar impar de zerouri, se verifica si nibble-ul superior al urmatorului octet.
+An even number of zeros is checked as whole zero bytes. An odd number additionally requires the upper nibble of the next byte to be zero. This avoids converting every digest to text.
 
-Aceasta este o verificare mai directa si evita generarea completa a hash-ului in format text pentru fiecare nonce testat.
+### 5.5. Selecting the result
 
-### 5.5. Selectarea rezultatului
-
-Mai multe thread-uri pot gasi nonce-uri valide in acelasi batch. Pentru a pastra cel mai mic nonce valid, kernelul foloseste:
+Several threads may find valid nonces in the same batch. The smallest is retained using:
 
 ```c
 atomicMin(best_nonce, nonce);
 ```
 
-In plus, se seteaza flag-ul:
+A separate flag is set:
 
 ```c
 atomicExch(found, 1);
 ```
 
-Pe host, dupa fiecare kernel, se copiaza `found`. Daca este 1, inseamna ca batch-ul curent contine cel putin un nonce valid. Apoi se copiaza `best_nonce`, care reprezinta cel mai mic nonce valid din acel batch.
+After each kernel, the host copies `found`. If it is 1, it copies `best_nonce`, the smallest valid nonce in that batch.
 
-Batch-urile sunt parcurse crescator, deci primul batch in care `found` devine 1 este suficient pentru a obtine nonce-ul final.
+Batches are processed in increasing order, so the first successful batch is sufficient to select the final nonce.
 
-Dupa gasirea nonce-ului, acesta este adaugat la `block_content`, iar hash-ul final al blocului este recalculat pe host.
+The selected nonce is appended to `block_content`, and the final block hash is recalculated on the host.
 
----
+## 6. Helper functions
 
-## 6. Functii auxiliare
+Several helpers are retained or adapted for host/device use:
 
-Am pastrat si adaptat mai multe functii auxiliare pentru a putea fi folosite atat pe host, cat si pe device:
+- `d_strlen`: a simple `strlen` implementation.
+- `d_strcpy`: device string copying.
+- `d_strcat`: device string concatenation.
+- `sha256_to_hex`: binary-digest-to-hexadecimal conversion.
+- `apply_sha256_len`: SHA-256 for an input of known length.
+- `apply_sha256`: SHA-256 for a null-terminated string.
 
-- `d_strlen` - varianta simpla de `strlen`;
-- `d_strcpy` - copiere de string pe device;
-- `d_strcat` - concatenare de string pe device;
-- `sha256_to_hex` - conversie digest binar in hash hex;
-- `apply_sha256_len` - SHA-256 pentru input cu lungime cunoscuta;
-- `apply_sha256` - SHA-256 pentru string terminat cu `\0`.
+These preserve the hash format used by the CPU implementation.
 
-Aceste functii ajuta la pastrarea aceluiasi format al hash-urilor ca in implementarea CPU.
+## 7. GPU warm-up
 
----
+`warm_up_gpu` has two purposes:
 
-## 7. Warm-up GPU
+1. Initialize the CUDA context by launching a simple kernel.
+2. Preallocate the main buffers.
 
-Functia `warm_up_gpu` are doua roluri:
+It also launches `clock_warmup_kernel`, which executes a GPU loop to make the GPU active before timing important functions.
 
-1. forteaza initializarea contextului CUDA prin lansarea unui kernel simplu;
-2. prealoca bufferele principale folosite ulterior.
-
-In plus, este lansat `clock_warmup_kernel`, care executa o bucla pe GPU. Scopul este ca GPU-ul sa fie deja activ inainte de masurarea functiilor importante.
-
-Prealocarea foloseste dimensiuni fixe:
+Preallocation uses fixed sizes:
 
 ```c
 #define PREALLOC_TRANSACTIONS_BYTES (64ULL * 1024ULL * 1024ULL)
 #define PREALLOC_HASHES_BYTES (16ULL * 1024ULL * 1024ULL)
 ```
 
-Astfel, pentru testele obisnuite, memoria este deja disponibila in momentul in care se proceseaza blocurile.
+For typical tests, the memory is therefore available before block processing begins.
 
----
+## 8. Correctness
 
-## 8. Corectitudine
+The implementation follows these rules:
 
-Pentru corectitudine, implementarea respecta urmatoarele reguli:
+- Transactions are hashed without their terminating null character.
+- Merkle hashes are combined in pairs.
+- The final hash is duplicated when a level has an odd number of nodes.
+- Reduction continues until one hash remains.
+- Nonce batches are generated in increasing order.
+- `atomicMin` retains the smallest valid nonce within a batch.
+- `found` indicates whether the current batch contains a valid result.
+- The block hash is recalculated on the host after nonce selection.
 
-- fiecare tranzactie este hash-uita fara caracterul nul final;
-- hash-urile Merkle sunt combinate doua cate doua;
-- la numar impar de hash-uri, ultimul element este duplicat;
-- nivelurile Merkle sunt procesate pana ramane un singur hash;
-- nonce-urile sunt generate in ordine crescatoare pe batch-uri;
-- in interiorul unui batch, se retine cel mai mic nonce valid cu `atomicMin`;
-- flag-ul `found` indica daca batch-ul curent contine cel putin un rezultat valid;
-- hash-ul blocului este recalculat pe host dupa alegerea nonce-ului.
+## 9. Building and running
 
----
-
-## 9. Compilare si rulare
-
-Pentru compilare:
+Build:
 
 ```bash
 make
 ```
 
-Pentru rulare:
+Run:
 
 ```bash
 make run TEST=test1
@@ -267,140 +247,104 @@ make run TEST=test3
 make run TEST=test4
 ```
 
-Pentru curatare:
+Clean:
 
 ```bash
 make clean
 ```
 
-Testarea finala trebuie facuta pe infrastructura indicata in enunt, deoarece timpii depind de GPU-ul folosit.
+Final tests must run on the infrastructure specified in the assignment because execution times depend on the GPU.
 
----
+## 10. Performance observations
 
-## 10. Observatii despre performanta
+Merkle parallelization is most useful for blocks with many transactions. Initial hashes are independent, and each tree level reduces the number of elements.
 
-Pentru Merkle root, paralelizarea este eficienta mai ales cand exista multe tranzactii in bloc. Hash-uirea initiala este complet independenta, iar nivelurile arborelui reduc treptat numarul de elemente.
+Nonce-search performance depends on difficulty and the position of the first valid nonce. An early result requires few batches; a later result requires more.
 
-Pentru nonce, performanta depinde de dificultate si de pozitia primului nonce valid. Daca nonce-ul valid apare devreme, sunt lansate putine batch-uri. Daca apare tarziu, se testeaza mai multe batch-uri.
+Batch size is a tradeoff. Smaller batches allow more frequent host-side checks but require more kernel launches and small transfers. Larger batches reduce launch overhead but may perform more work after a valid nonce has already been found within a batch.
 
-Dimensiunea batch-ului reprezinta un compromis. Un batch mai mic permite verificarea mai frecventa a rezultatului pe host, dar creste numarul de lansari de kernel si numarul de transferuri mici. Un batch mai mare reduce overhead-ul de lansare, dar poate face mai multa munca dupa ce exista deja un nonce valid in batch.
+This implementation uses 2^16 nonces per batch.
 
-In aceasta implementare am folosit `2^16` nonce-uri pe batch.
+## 11. Limitations and possible improvements
 
----
+Possible improvements include:
 
-## 11. Limitari si imbunatatiri posibile
+- Testing different `NONCE_BATCH_SIZE` values, since the best size depends on the workload and GPU.
+- Replacing the `found` flag with a direct `best_nonce` check to reduce one `cudaMemset` and one transfer per batch, provided the no-result sentinel is handled correctly. The current version explicitly separates result presence from the minimum nonce value.
+- Processing very small Merkle levels on the CPU or combining steps to reduce kernel-launch overhead when few nodes remain.
 
-O prima imbunatatire posibila ar fi testarea mai multor valori pentru `NONCE_BATCH_SIZE`, deoarece dimensiunea optima depinde de test si de GPU.
+## 12. LLM prompts used
 
-O alta imbunatatire ar fi eliminarea flag-ului `found` si verificarea directa a valorii `best_nonce`, pentru a reduce un `cudaMemset` si un transfer host-device per batch. Totusi, varianta actuala este usor de inteles si separa clar ideea de "s-a gasit ceva" de valoarea nonce-ului minim.
+**Tool:** ChatGPT -- GPT-5.5 Thinking  
+**Purpose:** clarifying CUDA concepts, understanding implementation tradeoffs and drafting documentation.
 
-Pentru Merkle root, o optimizare suplimentara ar fi tratarea nivelurilor foarte mici pe CPU sau combinarea unor pasi, pentru a reduce overhead-ul de kernel launch cand raman putine noduri.
-
----
-
-## 12. Prompturi LLM folosite
-
-Unealta folosita: **ChatGPT - GPT-5.5 Thinking**  
-Scop: clarificarea unor concepte CUDA, intelegerea impactului unor decizii de implementare si redactarea documentatiei.
+The prompts below are English translations of those recorded in the original submission.
 
 ### Prompt 1
 
-**Intrebare:**
+**Question:**
 
-> cum pot construi un Merkle root pe GPU daca am deja un vector de tranzactii si trebuie sa dublez ultimul hash cand numarul de elemente este impar?
+> How can I construct a Merkle root on the GPU from an array of transactions when the last hash must be duplicated if the number of elements is odd?
 
-**Raspuns primit, pe scurt:**
+**Response summary:** First hash transactions in parallel, then construct the tree level by level. A thread processes one pair of hashes; an incomplete pair uses the same hash twice.
 
-Modelul a explicat ca o abordare potrivita este sa se calculeze mai intai hash-ul fiecarei tranzactii in paralel, apoi sa se construiasca arborele nivel cu nivel. Pentru fiecare nivel, un thread poate procesa o pereche de hash-uri, iar daca perechea nu este completa, se foloseste de doua ori acelasi hash.
-
-**Utilitate:**
-
-Explicatia a fost utila pentru organizarea kernelului `merkle_level_kernel` si pentru validarea regulii de duplicare a ultimului hash.
-
----
+**Usefulness:** Helped organize `merkle_level_kernel` and validate the last-hash duplication rule.
 
 ### Prompt 2
 
-**Intrebare:**
+**Question:**
 
-> dc se folosesc doua buffere pe device pentru construirea arborelui Merkle si cum se schimba pointerii intre niveluri?
+> Why are two device buffers used to construct the Merkle tree, and how are their pointers swapped between levels?
 
-**Raspuns primit, pe scurt:**
+**Response summary:** With ping-pong buffers, the current level is read from one buffer and the next is written to the other. Swapping pointers avoids new allocations at each step and intermediate CPU copies.
 
-Modelul a descris tehnica ping-pong buffer: nivelul curent este citit dintr-un buffer, iar nivelul urmator este scris in celalalt. Dupa fiecare nivel, pointerii se interschimba. Astfel nu este nevoie sa se aloce memorie noua pentru fiecare pas si nu se copiaza nivelurile intermediare pe CPU.
-
-**Utilitate:**
-
-Raspunsul a ajutat la intelegerea motivului pentru care `g_d_hashes_a` si `g_d_hashes_b` sunt suficiente pentru intreaga constructie a arborelui.
-
----
+**Usefulness:** Clarified why `g_d_hashes_a` and `g_d_hashes_b` are sufficient for the entire tree.
 
 ### Prompt 3
 
-**Intrebare:**
+**Question:**
 
-> cum pot cauta nonce-uri pe GPU in batch-uri si cum pot afla daca un batch contine un nonce valid?
+> How can I search GPU nonces in batches and determine whether a batch contains a valid nonce?
 
-**Raspuns primit, pe scurt:**
+**Response summary:** Each thread tests `start_nonce + tid`. A successful thread sets a flag with `atomicExch`; `atomicMin` retains the smallest valid nonce.
 
-Modelul a explicat ca fiecare thread poate testa un nonce diferit, calculat ca `start_nonce + tid`. Daca un thread gaseste un nonce valid, poate seta un flag global cu `atomicExch`. Pentru a pastra cel mai mic nonce valid din batch, se poate folosi `atomicMin`.
-
-**Utilitate:**
-
-Raspunsul a fost util pentru structura kernelului `find_nonce_kernel`, unde folosesc atat `g_d_found`, cat si `g_d_best_nonce`.
-
----
+**Usefulness:** Helped structure `find_nonce_kernel`, which uses both `g_d_found` and `g_d_best_nonce`.
 
 ### Prompt 4
 
-**Intrebare:**
+**Question:**
 
-> dc este mai eficient sa initializez contextul SHA-256 pentru prefixul blocului o singura data si apoi sa adaug doar nonce-ul in kernel?
+> Why is it more efficient to initialize the SHA-256 context for the block prefix once and append only the nonce in the kernel?
 
-**Raspuns primit, pe scurt:**
+**Response summary:** The fixed block prefix is identical for every nonce. Processing it once allows each thread to handle only the variable suffix, reducing repeated work.
 
-Modelul a explicat ca partea fixa a blocului este aceeasi pentru toate nonce-urile. Daca aceasta este introdusa o singura data intr-un context SHA-256, fiecare thread trebuie sa proceseze doar partea variabila, adica nonce-ul. Acest lucru reduce munca repetata pentru fiecare incercare.
-
-**Utilitate:**
-
-Explicatia a clarificat optimizarea folosita in `find_nonce`, unde `prefix_ctx` este pregatit pe host si transmis catre kernel.
-
----
+**Usefulness:** Clarified the optimization in `find_nonce`, where `prefix_ctx` is prepared on the host and passed to the kernel.
 
 ### Prompt 5
 
-**Intrebare:**
+**Question:**
 
-> cce ar trebui sa explic in README pentru o tema CUDA cu Merkle root si Proof of Work ca sa fie clar la evaluare?
+> What should a README explain for a CUDA Merkle-root and Proof-of-Work assignment so that the implementation is clear during evaluation?
 
-**Raspuns primit, pe scurt:**
+**Response summary:** Explain the Merkle and nonce flows separately, GPU allocations, atomic operations, correctness checks and testing. Include manual decisions and limitations.
 
-Modelul a recomandat sa fie explicate separat fluxul pentru Merkle root, fluxul pentru nonce, alocarile pe GPU, folosirea operatiilor atomice, verificarile de corectitudine si modul de testare. De asemenea, a recomandat mentionarea deciziilor manuale si a limitarilor implementarii.
+**Usefulness:** Helped structure this README and make its explanations easier to follow.
 
-**Utilitate:**
+## 13. Manual decisions
 
-Raspunsul a fost util pentru structurarea acestui README si pentru formularea explicatiilor intr-un mod mai usor de urmarit.
+The final implementation includes these manually selected choices:
 
----
+- 256 threads per block for the main kernels.
+- Global buffers to avoid repeated allocations.
+- Batched nonce searching.
+- A `found` flag to detect whether a batch contains a result.
+- `atomicMin` to select the smallest valid nonce.
+- A custom device-side nonce conversion function instead of `sprintf`.
+- Host-side recalculation of the final block hash.
+- A warm-up function to initialize and prepare the GPU.
 
-## 13. Decizii luate manual
+## 14. Conclusion
 
-In implementarea finala am ales manual urmatoarele aspecte:
+The solution moves repeated transaction hashing, Merkle reduction and nonce testing onto the GPU. Global buffers, level-wise reduction and batched searching reduce serial CPU work.
 
-- folosirea a 256 de thread-uri per block pentru kernelurile principale;
-- pastrarea bufferelor globale pentru a evita alocarile repetate;
-- impartirea cautarii nonce-ului in batch-uri;
-- folosirea flag-ului `found` pentru a sti rapid daca un batch contine rezultat;
-- folosirea lui `atomicMin` pentru a alege cel mai mic nonce valid;
-- conversia nonce-ului pe device cu o functie proprie, nu cu `sprintf`;
-- recalcularea hash-ului final al blocului pe host dupa gasirea nonce-ului;
-- folosirea unei functii de warm-up pentru initializarea si pregatirea GPU-ului.
-
----
-
-## 14. Concluzie
-
-Solutia muta pe GPU operatiile care se repeta de foarte multe ori: hash-uirea tranzactiilor, reducerea Merkle si testarea nonce-urilor. Prin folosirea bufferelor globale, a reducerii pe niveluri si a cautarii in batch-uri, implementarea reduce timpul petrecut in calcule seriale pe CPU.
-
-Varianta este gandita pentru a fi clara, usor de verificat si compatibila cu cerintele temei. Performanta exacta trebuie evaluata prin rularea testelor pe infrastructura ceruta.
+The implementation is designed to be understandable, verifiable and compatible with the assignment requirements. Exact performance must be evaluated on the specified infrastructure.
